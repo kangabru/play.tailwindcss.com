@@ -1,4 +1,3 @@
-import autoprefixer from 'autoprefixer'
 import { klona } from 'klona/full'
 import { VIRTUAL_SOURCE_PATH, VIRTUAL_HTML_FILENAME } from '../constants'
 import extractClasses from './extractClasses'
@@ -7,18 +6,27 @@ const deps = {
   1: [
     () => import('tailwindcss-v1'),
     () => import('postcss-v7'),
+    () => import('autoprefixer-postcss7'),
     () => import('tailwindcss-v1/lib/featureFlags'),
   ],
   2: [
+    () => import('tailwindcss-v2'),
+    () => import('postcss'),
+    () => import('autoprefixer'),
+    () => import('tailwindcss-v2/lib/featureFlags'),
+    () => import('tailwindcss-v2/resolveConfig'),
+  ],
+  3: [
     () => import('tailwindcss'),
     () => import('postcss'),
+    () => import('autoprefixer'),
     () => import('tailwindcss/lib/featureFlags'),
     () => import('tailwindcss/resolveConfig'),
   ],
 }
 
 const applyModule1 = require('tailwindcss-v1/lib/flagged/applyComplexClasses')
-const applyModule2 = require('tailwindcss/lib/lib/substituteClassApplyAtRules')
+const applyModule2 = require('tailwindcss-v2/lib/lib/substituteClassApplyAtRules')
 
 const apply1 = applyModule1.default
 const apply2 = applyModule2.default
@@ -32,7 +40,7 @@ export async function processCss(
 ) {
   let jit = false
   const config = klona(configInput)
-  const [tailwindcss, postcss, featureFlags, resolveConfig] = (
+  const [tailwindcss, postcss, autoprefixer, featureFlags, resolveConfig] = (
     await Promise.all(deps[tailwindVersion].map((x) => x()))
   ).map((x) => x.default || x)
 
@@ -42,8 +50,15 @@ export async function processCss(
     typeof config.separator === 'undefined' ? ':' : config.separator
   separator = `${separator}`
 
-  if (tailwindVersion === '2' && config.mode === 'jit') {
-    config.purge = [VIRTUAL_HTML_FILENAME]
+  if (
+    (tailwindVersion === '2' && config.mode === 'jit') ||
+    tailwindVersion === '3'
+  ) {
+    if (tailwindVersion === '3') {
+      config.content = [VIRTUAL_HTML_FILENAME]
+    } else {
+      config.purge = [VIRTUAL_HTML_FILENAME]
+    }
     jit = true
   } else {
     config.separator = `__TWSEP__${separator}__TWSEP__`
@@ -52,7 +67,7 @@ export async function processCss(
 
   let jitContext
   if (jit && !skipIntelliSense) {
-    jitContext = require('tailwindcss/lib/jit/lib/setupContextUtils').createContext(
+    jitContext = require('tailwindcss-v2/lib/jit/lib/setupContextUtils').createContext(
       resolveConfig(config)
     )
   }
@@ -61,8 +76,14 @@ export async function processCss(
     tailwindVersion === '1' ? applyModule1 : applyModule2
 
   applyComplexClasses.default = (config, ...args) => {
+    if (tailwindVersion === '3') {
+      return require('tailwindcss/lib/lib/expandApplyAtRules').default(
+        jitContext
+      )
+    }
+
     if (jit) {
-      return require('tailwindcss/lib/jit/lib/expandApplyAtRules').default(
+      return require('tailwindcss-v2/lib/jit/lib/expandApplyAtRules').default(
         jitContext
       )
     }
@@ -126,7 +147,7 @@ export async function processCss(
       })
     ).css
 
-    if (!skipIntelliSense) {
+    if (!skipIntelliSense && tailwindVersion !== '3') {
       lspRoot = (
         await postcss([
           tailwindcss({ ...config, mode: 'aot', purge: false, variants: [] }),
@@ -140,15 +161,19 @@ export async function processCss(
 
   let state
 
-  if (lspRoot) {
+  if (lspRoot || (tailwindVersion === '3' && !skipIntelliSense)) {
     state = {}
     state.jit = jit
-    state.classNames = await extractClasses(lspRoot)
+    if (lspRoot) {
+      state.classNames = await extractClasses(lspRoot)
+    }
     state.separator = separator
     state.version =
       tailwindVersion === '1'
-        ? require('tailwindcss-v1/package.json?version').version
-        : require('tailwindcss/package.json?version').version
+        ? require('tailwindcss-v1/package.json?fields=version').version
+        : tailwindVersion === '2'
+        ? require('tailwindcss-v2/package.json?fields=version').version
+        : require('tailwindcss/package.json?fields=version').version
     state.editor = {
       userLanguages: {},
       capabilities: {},

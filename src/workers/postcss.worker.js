@@ -6,6 +6,7 @@ import {
   doHover,
   getDocumentColors,
   completionsFromClassList,
+  getColor,
 } from 'tailwindcss-language-service'
 import {
   asCompletionResult as asMonacoCompletionResult,
@@ -18,7 +19,7 @@ import {
   asCompletionItem as asLspCompletionItem,
   asRange as asLspRange,
 } from '../monaco/monacoToLsp'
-import CompileWorker from 'worker-loader?publicPath=/_next/&filename=static/chunks/[name].[hash].js&chunkFilename=static/chunks/[id].[contenthash].worker.js!./compile.worker.js'
+import CompileWorker from 'worker-loader!./compile.worker.js'
 import { createWorkerQueue } from '../utils/workers'
 import './subworkers'
 import { getVariants } from '../utils/getVariants'
@@ -29,6 +30,10 @@ import { isObject } from '../utils/object'
 const compileWorker = createWorkerQueue(CompileWorker)
 
 let state
+
+let lastHtml
+let lastCss
+let lastConfig
 
 addEventListener('message', async (event) => {
   if (event.data.lsp) {
@@ -76,14 +81,19 @@ addEventListener('message', async (event) => {
         )
         break
       case 'resolveCompletionItem':
-        result = await fallback(async () =>
-          asMonacoCompletionItem(
-            await resolveCompletionItem(
-              state,
-              asLspCompletionItem(event.data.lsp.item)
-            )
+        result = await fallback(async () => {
+          let item = await resolveCompletionItem(
+            state,
+            asLspCompletionItem(event.data.lsp.item)
           )
-        )
+          if (item.documentation?.value) {
+            item.documentation.value = item.documentation.value.replace(
+              /^```css/,
+              '```tailwindcss'
+            )
+          }
+          return asMonacoCompletionItem(item)
+        })
         break
       case 'hover':
         result = await fallback(async () => {
@@ -126,7 +136,23 @@ addEventListener('message', async (event) => {
       typeof event.data.html !== 'undefined') ||
     event.data._recompile
   ) {
-    const result = await compileWorker.emit(event.data)
+    const html = event.data._recompile ? lastHtml : event.data.html
+    const css = event.data._recompile ? lastCss : event.data.css
+    const config = event.data._recompile ? lastConfig : event.data.config
+
+    const isFreshBuild = css !== lastCss || config !== lastConfig
+
+    lastHtml = html
+    lastCss = css
+    lastConfig = config
+
+    const result = await compileWorker.emit({
+      ...event.data,
+      _isFreshBuild: isFreshBuild,
+      html,
+      css,
+      config,
+    })
 
     if (!result.error && !result.canceled) {
       if ('buildId' in result) {
@@ -145,19 +171,29 @@ addEventListener('message', async (event) => {
           import('postcss'),
           import('postcss-selector-parser'),
           result.state.jit
-            ? import('tailwindcss/lib/jit/lib/generateRules')
+            ? tailwindVersion === '2'
+              ? import('tailwindcss-v2/lib/jit/lib/generateRules')
+              : import('tailwindcss/lib/lib/generateRules')
             : {},
           result.state.jit
-            ? import('tailwindcss/lib/jit/lib/setupContextUtils')
+            ? tailwindVersion === '2'
+              ? import('tailwindcss-v2/lib/jit/lib/setupContextUtils')
+              : import('tailwindcss/lib/lib/setupContextUtils')
             : {},
           result.state.jit
-            ? import('tailwindcss/lib/jit/lib/expandApplyAtRules')
+            ? tailwindVersion === '2'
+              ? import('tailwindcss-v2/lib/jit/lib/expandApplyAtRules')
+              : import('tailwindcss/lib/lib/expandApplyAtRules')
             : {},
           tailwindVersion === '2'
+            ? import('tailwindcss-v2/resolveConfig')
+            : tailwindVersion === '3'
             ? import('tailwindcss/resolveConfig')
             : import('tailwindcss-v1/resolveConfig'),
           result.state.jit
-            ? import('tailwindcss/lib/jit/lib/setupTrackingContext')
+            ? tailwindVersion === '2'
+              ? import('tailwindcss-v2/lib/jit/lib/setupTrackingContext')
+              : import('tailwindcss/lib/lib/setupTrackingContext')
             : {},
         ])
 
@@ -178,10 +214,17 @@ addEventListener('message', async (event) => {
               }
             : {}),
         }
-        let config = await parseConfig(event.data.config, tailwindVersion)
-        state.config = resolveConfig(config)
+        state.config = resolveConfig(await parseConfig(config, tailwindVersion))
         if (result.state.jit) {
           state.jitContext = createContext(state.config)
+          if (state.jitContext.getClassList) {
+            state.classList = state.jitContext
+              .getClassList()
+              .filter((className) => className !== '*')
+              .map((className) => {
+                return [className, { color: getColor(state, className) }]
+              })
+          }
         }
       }
       state.variants = getVariants(state)
@@ -194,6 +237,7 @@ addEventListener('message', async (event) => {
         },
         tailwindCSS: {
           validate: true,
+          classAttributes: ['class'],
           lint: {
             cssConflict: 'warning',
             invalidApply: 'error',
